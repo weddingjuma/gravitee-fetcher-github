@@ -17,10 +17,9 @@ package io.gravitee.fetcher.github;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import io.gravitee.common.http.HttpStatusCode;
-import io.gravitee.fetcher.api.Resource;
-import io.gravitee.fetcher.api.Fetcher;
-import io.gravitee.fetcher.api.FetcherException;
+import io.gravitee.fetcher.api.*;
 import io.gravitee.fetcher.github.vertx.VertxCompletableFuture;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -36,15 +35,14 @@ import org.springframework.beans.factory.annotation.Value;
 
 import java.io.ByteArrayInputStream;
 import java.net.URI;
-import java.util.Base64;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
  * @author Nicolas GERAUD (nicolas.geraud at graviteesource.com) 
  * @author GraviteeSource Team
  */
-public class GitHubFetcher implements Fetcher {
+public class GitHubFetcher implements FilesFetcher {
 
     private static final Logger logger = LoggerFactory.getLogger(GitHubFetcher.class);
     private static final String HTTPS_SCHEME = "https";
@@ -84,36 +82,66 @@ public class GitHubFetcher implements Fetcher {
     }
 
     @Override
+    public FilepathAwareFetcherConfiguration getConfiguration() {
+        return this.gitHubFetcherConfiguration;
+    }
+
+    @Override
     public Resource fetch() throws FetcherException {
         checkRequiredFields();
-        try {
-            Buffer buffer = fetchContent().join();
-            final Resource resource = new Resource();
-            if (buffer == null || buffer.length() == 0) {
-                logger.warn("Something goes wrong, GitHub responds with a status 200 but the content is empty.");
-            } else {
-                JsonNode jsonNode = mapper.readTree(buffer.getBytes());
-                if (jsonNode != null) {
-                    final Map<String, Object> metadata = mapper.convertValue(jsonNode, Map.class);
-                    final Object content = metadata.remove("content");
-                    if (content != null) {
-                        final String contentAsBase64 = String.valueOf(content).replaceAll("\\n","");
-                        byte[] decodedContent = Base64.getDecoder().decode(contentAsBase64);
-                        resource.setContent(new ByteArrayInputStream(decodedContent));
-                    }
-                    final Object htmlUrl = metadata.get("html_url");
-                    if (htmlUrl != null) {
-                        metadata.put(EDIT_URL_PROPERTY_KEY, String.valueOf(htmlUrl).replace("blob", "edit"));
-                    }
-                    metadata.put(PROVIDER_NAME_PROPERTY_KEY, "GitHub");
-                    resource.setMetadata(metadata);
-                }
+        JsonNode jsonNode = this.request(getFetchUrl());
+
+        final Resource resource = new Resource();
+        if (jsonNode != null) {
+            final Map<String, Object> metadata = mapper.convertValue(jsonNode, Map.class);
+            final Object content = metadata.remove("content");
+            if (content != null) {
+                final String contentAsBase64 = String.valueOf(content).replaceAll("\\n","");
+                byte[] decodedContent = Base64.getDecoder().decode(contentAsBase64);
+                resource.setContent(new ByteArrayInputStream(decodedContent));
             }
-            return resource;
-        } catch (Exception ex) {
-            logger.error(ex.getMessage(), ex);
-            throw new FetcherException("Unable to fetch GitHub content (" + ex.getMessage() + ")", ex);
+            final Object htmlUrl = metadata.get("html_url");
+            if (htmlUrl != null) {
+                metadata.put(EDIT_URL_PROPERTY_KEY, String.valueOf(htmlUrl).replace("blob", "edit"));
+            }
+            metadata.put(PROVIDER_NAME_PROPERTY_KEY, "GitHub");
+            resource.setMetadata(metadata);
         }
+        return resource;
+    }
+
+    @Override
+    public String[] files() throws FetcherException {
+        JsonNode jsonNode = this.request(getTreeUrl());
+        List<String> result = new ArrayList<>();
+        if (jsonNode != null) {
+            JsonNode truncated = jsonNode.get("truncated");
+            if (truncated != null && !truncated.asBoolean(false)) {
+                JsonNode rawTree = jsonNode.get("tree");
+                if (rawTree != null && rawTree.isArray()) {
+                    String filepath = gitHubFetcherConfiguration.getFilepath().trim();
+                    if (filepath.startsWith("/")) {
+                        filepath = filepath.replaceFirst("/", "");
+                    }
+                    ArrayNode tree = (ArrayNode) rawTree;
+                    Iterator<JsonNode> elements = tree.elements();
+                    while (elements.hasNext()) {
+                        JsonNode elt = elements.next();
+                        String type = elt.get("type").asText();
+                        String path = elt.get("path").asText();
+                        if ("blob".equals(type) && (filepath.isEmpty() || path.startsWith(filepath))) {
+                            int lastIndexOfDot = path.lastIndexOf('.');
+                            if (lastIndexOfDot > 0) {
+                                result.add("/" + path);
+                            }
+                        }
+                    }
+                }
+            } else {
+                throw new FetcherException("Too many tree elements to retrieve.", null);
+            }
+        }
+        return result.toArray(new String[0]);
     }
 
     private void checkRequiredFields() throws FetcherException {
@@ -125,7 +153,7 @@ public class GitHubFetcher implements Fetcher {
         }
     }
 
-    private String getRequestUrl() {
+    private String getFetchUrl() {
         return gitHubFetcherConfiguration.getGithubUrl()
                 + "/repos"
                 + "/" + gitHubFetcherConfiguration.getOwner()
@@ -136,10 +164,38 @@ public class GitHubFetcher implements Fetcher {
                     ? ("?ref=" + gitHubFetcherConfiguration.getBranchOrTag()) : "");
     }
 
-    private CompletableFuture<Buffer> fetchContent() throws Exception {
-        CompletableFuture<Buffer> future = new VertxCompletableFuture<>(vertx);
 
-        String url = getRequestUrl();
+    private String getTreeUrl() {
+        return gitHubFetcherConfiguration.getGithubUrl()
+                + "/repos"
+                + "/" + gitHubFetcherConfiguration.getOwner()
+                + "/" + gitHubFetcherConfiguration.getRepository()
+                + "/git/trees/"
+                + (gitHubFetcherConfiguration.getBranchOrTag() != null && !gitHubFetcherConfiguration.getBranchOrTag().isEmpty()
+                ? (gitHubFetcherConfiguration.getBranchOrTag()) : "master")
+                + "?recursive=1";
+    }
+
+    private JsonNode request(String url) throws FetcherException {
+        checkRequiredFields();
+
+        try {
+            Buffer buffer = fetchContent(url).join();
+            if (buffer == null || buffer.length() == 0) {
+                logger.warn("Something goes wrong, GitHub responds with a status 200 but the content is empty.");
+                return null;
+            }
+
+            return new ObjectMapper().readTree(buffer.getBytes());
+        } catch (Exception ex) {
+            logger.error(ex.getMessage(), ex);
+            throw new FetcherException("Unable to fetch GitHub content (" + ex.getMessage() + ")", ex);
+        }
+    }
+
+
+    private CompletableFuture<Buffer> fetchContent(String url) throws Exception {
+        CompletableFuture<Buffer> future = new VertxCompletableFuture<>(vertx);
 
         URI requestUri = URI.create(url);
         boolean ssl = HTTPS_SCHEME.equalsIgnoreCase(requestUri.getScheme());
@@ -274,5 +330,9 @@ public class GitHubFetcher implements Fetcher {
         }
 
         return future;
+    }
+
+    public void setVertx(Vertx vertx) {
+        this.vertx = vertx;
     }
 }
